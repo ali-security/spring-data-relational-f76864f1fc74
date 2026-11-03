@@ -1,0 +1,118 @@
+# Sealed-build workflow for the ali-security fork.
+# Upstream CI runs on Jenkins (Jenkinsfile -> ci/test.sh) on JDK 17 ("main") and JDK 21 ("next");
+# there is no GitHub Actions build/test workflow, so this mirrors ci/test.sh:
+#   ci/accept-third-party-license.sh
+#   ./mvnw -s settings.xml -P${PROFILE} clean dependency:list verify -Dsort -U -B
+# over the spring-data-relational, spring-data-jdbc and spring-data-r2dbc reactor (default profile).
+name: Seal Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire/failsafe test selector (-Dtest / -Dit.test)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build and test (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '17', '21' ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+
+      - name: Accept third-party container licenses (as ci/test.sh does)
+        run: sh ci/accept-third-party-license.sh
+
+      - name: Build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -s settings.xml -Dscan=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false \
+              -pl spring-data-relational,spring-data-jdbc,spring-data-r2dbc -am clean dependency:list verify -Dsort -U -B \
+              -Dtest='${{ inputs.test-filter }}' -Dit.test='${{ inputs.test-filter }}' \
+              -Dsurefire.failIfNoSpecifiedTests=false -Dfailsafe.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -s settings.xml -Dscan=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false \
+              -pl spring-data-relational,spring-data-jdbc,spring-data-r2dbc -am clean dependency:list verify -Dsort -U -B
+          fi
+
+      # spring-data-jdbc's integration tests run on HSQLDB by default; the jdbc pom's own
+      # `postgres` profile adds the `postgres-test` failsafe execution (Testcontainers Postgres),
+      # which covers the tests that assume the postgres Spring profile. Upstream Jenkins runs
+      # them via -Pall-dbs. The hsql reports are moved aside first because both executions
+      # write the same TEST-*.xml names into failsafe-reports.
+      - name: spring-data-jdbc integration tests on PostgreSQL (postgres profile)
+        if: inputs.test-filter == ''
+        run: |
+          mv spring-data-jdbc/target/failsafe-reports spring-data-jdbc/target/failsafe-reports-hsql
+          ./mvnw -s settings.xml -Dscan=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false \
+            -Ppostgres -pl spring-data-relational,spring-data-jdbc -am \
+            test-compile failsafe:integration-test@postgres-test failsafe:verify -Dsort -B
+
+      - name: Upload jar
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-data-relational-jar
+          path: spring-data-relational/target/spring-data-relational-3.3.1.jar
+          if-no-files-found: error
+
+      - name: Per-module test report (passes and skipped tests with reasons)
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          grand = [0, 0, 0, 0]
+          suites = [
+              ("spring-data-relational", ["spring-data-relational/target/surefire-reports", "spring-data-relational/target/failsafe-reports"]),
+              ("spring-data-jdbc (unit + hsql integration)", ["spring-data-jdbc/target/surefire-reports", "spring-data-jdbc/target/failsafe-reports-hsql"]),
+              ("spring-data-jdbc (postgres integration)", ["spring-data-jdbc/target/failsafe-reports"]),
+              ("spring-data-r2dbc", ["spring-data-r2dbc/target/surefire-reports", "spring-data-r2dbc/target/failsafe-reports"]),
+          ]
+          if not os.path.isdir("spring-data-jdbc/target/failsafe-reports-hsql"):
+              suites[1] = ("spring-data-jdbc", ["spring-data-jdbc/target/surefire-reports", "spring-data-jdbc/target/failsafe-reports"])
+              del suites[2]
+          for module, dirs in suites:
+              files = sorted(sum((glob.glob(f"{d}/TEST-*.xml") for d in dirs), []))
+              t = f = e = s = 0
+              skipped = {}
+              for path in files:
+                  root = ET.parse(path).getroot()
+                  for case in root.iter("testcase"):
+                      t += 1
+                      if case.find("failure") is not None:
+                          f += 1
+                      elif case.find("error") is not None:
+                          e += 1
+                      else:
+                          sk = case.find("skipped")
+                          if sk is not None:
+                              s += 1
+                              msg = (sk.get("message") or "") + " " + (sk.text or "")
+                              msg = re.sub(r"\s+", " ", msg).strip()
+                              msg = re.split(r" at (?:java\.base/|org\.assertj\.|org\.junit\.)", msg)[0]
+                              msg = msg.replace("org.junit.AssumptionViolatedException: assumption was not met due to: ", "assumption: ")
+                              msg = msg[:220] or "(no message reported by runner)"
+                              skipped.setdefault((case.get("classname").split(".")[-1], msg), []).append(case.get("name"))
+              passed = t - f - e - s
+              print(f"=== {module}: {len(files)} report files, tests={t} passed={passed} failures={f} errors={e} skipped={s}")
+              for (cls, msg), names in sorted(skipped.items()):
+                  print(f"    SKIPPED x{len(names)} {cls} [{', '.join(n[:40] for n in names[:4])}{', ...' if len(names) > 4 else ''}]: {msg}")
+              for i, v in enumerate((t, f, e, s)):
+                  grand[i] += v
+          t, f, e, s = grand
+          print(f"=== TOTAL: tests={t} passed={t - f - e - s} failures={f} errors={e} skipped={s}")
+          EOF
